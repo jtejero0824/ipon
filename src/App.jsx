@@ -1,3 +1,4 @@
+// ipon v1.0.2
 import React, { useState, useEffect, useCallback, useRef } from "react";
 
 // ── Supabase config ──
@@ -175,6 +176,7 @@ export default function App() {
   const [isDark, setIsDark] = useState(true);
   const [loaded, setLoaded] = useState(false);
   const [loading, setLoading] = useState(false);
+  const [userId, setUserId] = useState(null);
 
   // UI state
   const [menuOpen, setMenuOpen] = useState(false);
@@ -224,9 +226,12 @@ export default function App() {
 
         if (sess?.access_token) {
           setSession(sess);
-          // Check if anon
-          const user = await sb.auth.getUser(sess.access_token);
-          setIsAnon(user?.is_anonymous ?? true);
+          // Get full user info to extract id reliably
+          const userResp = await sb.auth.getUser(sess.access_token);
+          const uid = userResp?.id || userResp?.sub || userResp?.user?.id || sess?.user?.id;
+          setUserId(uid);
+          setIsAnon(userResp?.is_anonymous ?? userResp?.user?.is_anonymous ?? true);
+          console.log("Session ready. userId:", uid);
           await loadData(sess.access_token);
         }
       } catch(e) { console.error(e); }
@@ -264,21 +269,27 @@ export default function App() {
 
   const handleAddGoal = async () => {
     if (!newGoal.name || !newGoal.target_amount || !newGoal.deadline) return;
-    const g = await sb.db.insertGoal(token, {
-      name: newGoal.name,
-      emoji: newGoal.emoji || "🏖️",
-      color: newGoal.color,
-      target_amount: parseFloat(newGoal.target_amount),
-      deadline: newGoal.deadline,
-      user_id: session.user?.id,
-    });
-    if (g?.id) {
-      const withContribs = { ...g, contributions: [] };
-      setGoals(prev => [...prev, withContribs]);
-      setActiveGoalId(g.id);
-    }
-    setShowAddGoal(false);
-    setNewGoal({name:"",emoji:"🏖️",target_amount:"",deadline:"",color:"#54A0FF"});
+    try {
+      console.log("Creating goal with userId:", userId, "token:", token?.slice(0,20));
+      const g = await sb.db.insertGoal(token, {
+        name: newGoal.name,
+        emoji: newGoal.emoji || "🏖️",
+        color: newGoal.color,
+        target_amount: parseFloat(newGoal.target_amount),
+        deadline: newGoal.deadline,
+        user_id: userId,
+      });
+      console.log("Goal insert response:", g);
+      if (g?.id) {
+        const withContribs = { ...g, contributions: [] };
+        setGoals(prev => [...prev, withContribs]);
+        setActiveGoalId(g.id);
+        setShowAddGoal(false);
+        setNewGoal({name:"",emoji:"🏖️",target_amount:"",deadline:"",color:"#54A0FF"});
+      } else {
+        console.error("Failed to create goal:", g);
+      }
+    } catch(e) { console.error("Error creating goal:", e); }
   };
 
   const handleSaveEditGoal = async () => {
@@ -301,7 +312,7 @@ export default function App() {
     const targetId = activeGoal?.id;
     const c = await sb.db.insertContribution(token, {
       goal_id: targetId,
-      user_id: session.user?.id,
+      user_id: userId,
       amount: parseFloat(newContrib.amount),
       note: newContrib.note,
       date: newContrib.date,
@@ -374,13 +385,14 @@ export default function App() {
   const handleSignOut = async () => {
     await sb.auth.signOut(token);
     localStorage.removeItem(SESSION_KEY);
-    setSession(null); setGoals([]); setActiveGoalId(null);
+    setSession(null); setGoals([]); setActiveGoalId(null); setUserId(null);
     setMenuOpen(false);
-    // Re-init with new anon session
     const data = await sb.auth.signInAnonymously();
-    if (data.access_token) {
+    if (data?.access_token) {
       localStorage.setItem(SESSION_KEY, JSON.stringify(data));
       setSession(data); setIsAnon(true);
+      const userResp = await sb.auth.getUser(data.access_token);
+      setUserId(userResp?.id || userResp?.sub || userResp?.user?.id);
     }
   };
 
@@ -735,36 +747,10 @@ function Modal({T,onClose,title,children}) {
 
 // ── New Goal Form ──
 function NewGoalForm({T,data,onChange,dateInputProps}) {
-  const debounceRef = useRef(null);
-  const onChangeRef = useRef(onChange);
-  const dataRef = useRef(data);
-  useEffect(()=>{onChangeRef.current=onChange;dataRef.current=data;});
-
-  const suggestEmoji = async (name) => {
-    if (!name||name.trim().length<3) return;
-    try {
-      const res = await fetch("https://api.anthropic.com/v1/messages",{
-        method:"POST",headers:{"Content-Type":"application/json"},
-        body:JSON.stringify({model:"claude-sonnet-4-20250514",max_tokens:10,
-          messages:[{role:"user",content:`Reply with a single emoji that best represents this savings goal: "${name}". Only output the emoji, nothing else.`}]})
-      });
-      const json = await res.json();
-      const emoji = json?.content?.[0]?.text?.trim();
-      if (emoji) onChangeRef.current({...dataRef.current,emoji});
-    } catch {}
-  };
-
-  const handleNameChange = (e) => {
-    const name = e.target.value;
-    onChange({...data,name});
-    clearTimeout(debounceRef.current);
-    debounceRef.current = setTimeout(()=>suggestEmoji(name),700);
-  };
-
   return (
     <>
       <label style={fieldLabelStyle(T)}>Goal Name</label>
-      <input style={inputStyle(T)} placeholder="e.g. Disney World Trip" value={data.name} onChange={handleNameChange} autoFocus/>
+      <input style={inputStyle(T)} placeholder="e.g. Disney World Trip" value={data.name} onChange={e=>onChange({...data,name:e.target.value})} autoFocus/>
       <label style={fieldLabelStyle(T)}>Target Amount ($)</label>
       <input style={inputStyle(T)} type="number" placeholder="5000" value={data.target_amount} onChange={e=>onChange({...data,target_amount:e.target.value})}/>
       <label style={fieldLabelStyle(T)}>Target Date</label>
