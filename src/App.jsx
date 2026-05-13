@@ -16,6 +16,7 @@ function createClient() {
       signIn: async (email, password) => { const r = await fetch(`${SUPABASE_URL}/auth/v1/token?grant_type=password`, { method:"POST", headers:h, body:JSON.stringify({ email, password }) }); return r.json(); },
       signOut: async token => { await fetch(`${SUPABASE_URL}/auth/v1/logout`, { method:"POST", headers:a(token) }); },
       getUser: async token => { const r = await fetch(`${SUPABASE_URL}/auth/v1/user`, { headers:a(token) }); return r.json(); },
+      refreshSession: async refreshToken => { const r = await fetch(`${SUPABASE_URL}/auth/v1/token?grant_type=refresh_token`, { method:"POST", headers:h, body:JSON.stringify({ refresh_token:refreshToken }) }); return r.json(); },
     },
     db: {
       getGoals: async t => { const r = await fetch(`${SUPABASE_URL}/rest/v1/goals?select=*&order=created_at.asc`, { headers:a(t) }); return r.json(); },
@@ -43,6 +44,12 @@ const findAccent = hex => ACCENTS.find(a=>a.hex===hex) || ACCENTS[0];
 const LIGHT = {bg:"#F6F4EF",surface:"#FFFFFF",surface2:"#FBF9F4",border:"#ECE7DA",borderStrong:"#D9D2C1",text:"#14110D",textSub:"#5B554A",textMute:"#8E8676",textFaint:"#B5AD9C"};
 const DARK  = {bg:"#0E0D0B",surface:"#1C1A16",surface2:"#242220",border:"#26231E",borderStrong:"#36322B",text:"#F4F1EA",textSub:"#BDB6A6",textMute:"#8B8472",textFaint:"#5C564B"};
 const FONT = "'Inter',-apple-system,system-ui,sans-serif";
+
+const FEATURES = [
+  { emoji:"📱", title:"Any device", desc:"Your goals sync across every device automatically." },
+  { emoji:"🛡️", title:"Safe & secure", desc:"Your data is encrypted and backed up at all times." },
+  { emoji:"📊", title:"Track progress", desc:"Monthly targets, time left, and on-track indicators." },
+];
 const FD   = "'Inter Tight','Inter',-apple-system,system-ui,sans-serif";
 
 // ── Helpers ──
@@ -193,30 +200,11 @@ function Sheet({open,onClose,T,children}){
 }
 
 // ── Goal Form ──
-function GoalForm({data,setData,title,sub,T,suggestEmoji=false}){
-  const debRef=useRef(null);
-  const dataRef=useRef(data);
-  const setDataRef=useRef(setData);
-  useEffect(()=>{dataRef.current=data;setDataRef.current=setData;},[data,setData]);
-
-  const suggest=async name=>{
-    if(!name||name.trim().length<3) return;
-    try{
-      const res=await fetch("https://api.anthropic.com/v1/messages",{
-        method:"POST",headers:{"Content-Type":"application/json"},
-        body:JSON.stringify({model:"claude-sonnet-4-20250514",max_tokens:10,
-          messages:[{role:"user",content:`Reply with a single emoji that best represents this savings goal: "${name}". Only output the emoji, nothing else.`}]})
-      });
-      const json=await res.json();
-      const emoji=json?.content?.[0]?.text?.trim();
-      if(emoji) setDataRef.current({...dataRef.current,emoji});
-    }catch{}
-  };
+function GoalForm({data,setData,title,sub,T}){
 
   const handleName=e=>{
     const name=e.target.value;
     setData({...data,name});
-    if(suggestEmoji){ clearTimeout(debRef.current); debRef.current=setTimeout(()=>suggest(name),700); }
   };
 
   const inp=(p={})=><input {...p} style={{width:"100%",minWidth:0,background:T.surface,border:`1px solid ${T.border}`,borderRadius:12,padding:"13px 14px",color:T.text,fontSize:15.5,fontFamily:FONT,display:"block",boxSizing:"border-box",colorScheme:"light dark",WebkitAppearance:"none",appearance:"none",...(p.style||{})}}/>;
@@ -276,6 +264,7 @@ export default function App(){
   const [isDark,setIsDark]=useState(false);
   const [loaded,setLoaded]=useState(false);
 
+  const [onboardingScreen,setOnboardingScreen]=useState("welcome"); // welcome|signup|signin|guest
   const [menuOpen,setMenuOpen]=useState(false);
   const [showAdd,setShowAdd]=useState(false);
   const [showEdit,setShowEdit]=useState(false);
@@ -298,7 +287,47 @@ export default function App(){
   const userIdRef=useRef(null);
   useEffect(()=>{userIdRef.current=userId;},[userId]);
 
+  // Auto-refresh session before it expires (every 50 minutes)
+  useEffect(()=>{
+    const refresh=async()=>{
+      try{
+        const sess=JSON.parse(localStorage.getItem(SESSION_KEY)||"null");
+        if(!sess?.refresh_token) return;
+        const data=await sb.auth.refreshSession(sess.refresh_token);
+        if(data?.access_token){
+          localStorage.setItem(SESSION_KEY,JSON.stringify(data));
+          setSession(data);
+          const uid=data?.user?.id||data?.id||userIdRef.current;
+          setUserId(uid); userIdRef.current=uid;
+        }
+      }catch(e){console.warn("Token refresh failed:",e);}
+    };
+    // Refresh every 50 minutes (tokens expire at 60 min)
+    const interval=setInterval(refresh, 50*60*1000);
+    // Also refresh immediately on tab focus if session is old
+    const onFocus=async()=>{
+      try{
+        const sess=JSON.parse(localStorage.getItem(SESSION_KEY)||"null");
+        if(!sess?.access_token) return;
+        // Check if token is close to expiry using the expires_at field
+        const expiresAt=sess.expires_at||(sess.expires_in?Date.now()/1000+sess.expires_in:null);
+        if(expiresAt&&(expiresAt-Date.now()/1000)<300){
+          await refresh();
+        }
+      }catch{}
+    };
+    window.addEventListener("focus",onFocus);
+    return()=>{clearInterval(interval);window.removeEventListener("focus",onFocus);};
+  },[]);
+
   const token=session?.access_token;
+  // Always read freshest token from storage in case state is stale
+  const getToken=()=>{
+    try{
+      const sess=JSON.parse(localStorage.getItem(SESSION_KEY)||"null");
+      return sess?.access_token||token;
+    }catch{return token;}
+  };
   const ag=goals.find(g=>g.id===activeId)||goals[0];
   const acc=findAccent(ag?.color||ACCENTS[0].hex);
   const T=isDark?DARK:LIGHT;
@@ -320,6 +349,16 @@ export default function App(){
       if(savedDark!==null) setIsDark(savedDark==="true");
       let sess=null;
       try{sess=JSON.parse(localStorage.getItem(SESSION_KEY)||"null");}catch{}
+
+      // Verify stored session is still valid — expired tokens cause 401s
+      if(sess?.access_token){
+        try{
+          const check=await sb.auth.getUser(sess.access_token);
+          const validId=check?.id||check?.sub||check?.user?.id;
+          if(!validId||check?.error){sess=null;localStorage.removeItem(SESSION_KEY);}
+        }catch{sess=null;localStorage.removeItem(SESSION_KEY);}
+      }
+
       if(!sess){
         const data=await sb.auth.signInAnonymously();
         if(data?.access_token){sess=data;localStorage.setItem(SESSION_KEY,JSON.stringify(sess));}
@@ -348,20 +387,25 @@ export default function App(){
 
   const handleAddGoal=async()=>{
     if(!newG.name||!newG.target_amount||!newG.deadline) return;
+    const uid=userIdRef.current||userId;
+    console.log("handleAddGoal: token=",token?.slice(0,20),"uid=",uid,"goal=",newG);
     try{
-      const g=await sb.db.insertGoal(token,{name:newG.name,emoji:newG.emoji||"🎯",color:newG.color,target_amount:parseFloat(newG.target_amount),deadline:newG.deadline,user_id:userIdRef.current});
+      const g=await sb.db.insertGoal(getToken(),{name:newG.name,emoji:newG.emoji||"🎯",color:newG.color,target_amount:parseFloat(newG.target_amount),deadline:newG.deadline,user_id:uid});
+      console.log("insertGoal response:",g);
       if(g?.id){
         setGoals(p=>[...p,{...g,contributions:[]}]);
         setActiveId(g.id);
         setShowAdd(false);
         setNewG({name:"",emoji:"🎯",target_amount:"",deadline:tod(),color:ACCENTS[0].hex});
+      } else {
+        console.error("Goal insert failed:",g);
       }
-    }catch(e){console.error(e);}
+    }catch(e){console.error("handleAddGoal error:",e);}
   };
 
   const handleSaveEdit=async()=>{
     if(!editD?.name||!editD?.target_amount||!editD?.deadline) return;
-    const u=await sb.db.updateGoal(token,editD.id,{name:editD.name,emoji:editD.emoji,color:editD.color,target_amount:parseFloat(editD.target_amount),deadline:editD.deadline});
+    const u=await sb.db.updateGoal(getToken(),editD.id,{name:editD.name,emoji:editD.emoji,color:editD.color,target_amount:parseFloat(editD.target_amount),deadline:editD.deadline});
     if(u?.id) setGoals(p=>p.map(g=>g.id===editD.id?{...g,...u}:g));
     setShowEdit(false); setEditD(null);
   };
@@ -370,7 +414,7 @@ export default function App(){
     if(!newC.amount||parseFloat(newC.amount)<=0) return;
     const targetId=ag?.id;
     try{
-      const c=await sb.db.insertContribution(token,{goal_id:targetId,user_id:userIdRef.current,amount:parseFloat(newC.amount),note:newC.note,date:newC.date});
+      const c=await sb.db.insertContribution(getToken(),{goal_id:targetId,user_id:userIdRef.current,amount:parseFloat(newC.amount),note:newC.note,date:newC.date});
       if(c?.id){
         setGoals(p=>p.map(g=>g.id===targetId?{...g,contributions:[...(g.contributions||[]),c]}:g));
         if(isAnon&&goals.reduce((s,g)=>s+(g.contributions||[]).length,0)===0) setShowNudge(true);
@@ -381,13 +425,13 @@ export default function App(){
   };
 
   const handleDeleteContrib=async cid=>{
-    await sb.db.deleteContribution(token,cid);
+    await sb.db.deleteContribution(getToken(),cid);
     setGoals(p=>p.map(g=>({...g,contributions:(g.contributions||[]).filter(c=>c.id!==cid)})));
     setShowDeleteContrib(null);
   };
 
   const handleDeleteGoal=async gid=>{
-    await sb.db.deleteGoal(token,gid);
+    await sb.db.deleteGoal(getToken(),gid);
     const updated=goals.filter(g=>g.id!==gid);
     setGoals(updated);
     if(activeId===gid) setActiveId(updated[0]?.id||null);
@@ -395,21 +439,37 @@ export default function App(){
     setMenuOpen(false);
   };
 
-  const handleAuth=async()=>{
+  const handleAuth=async(modeOverride)=>{
     setAuthError(""); setAuthLoading(true);
     try{
-      if(authMode==="signup"){
+      const effectiveMode=modeOverride||authMode;
+      if(effectiveMode==="signup"){
+        // Convert anonymous account to real account
         const data=await sb.auth.signUp(authEmail,authPassword,token);
-        if(data.error){setAuthError(data.error.message||data.msg||"Sign up failed");}
-        else{setIsAnon(false);setShowAuth(false);setShowNudge(false);setUserId(data?.id||data?.user?.id||userIdRef.current);}
-      }else{
+        if(data.error||data.msg){
+          setAuthError(data.error?.message||data.msg||"Sign up failed");
+        } else {
+          // After signup, sign in with the new credentials to get a fresh token
+          const signInData=await sb.auth.signIn(authEmail,authPassword);
+          if(signInData?.access_token){
+            localStorage.setItem(SESSION_KEY,JSON.stringify(signInData));
+            setSession(signInData);
+            const uid=signInData?.user?.id||signInData?.id||userIdRef.current;
+            setUserId(uid); userIdRef.current=uid;
+            await loadData(signInData.access_token);
+          }
+          setIsAnon(false); setShowAuth(false); setShowNudge(false);
+        }
+      } else {
         const data=await sb.auth.signIn(authEmail,authPassword);
-        if(data.error){setAuthError(data.error.message||"Sign in failed");}
-        else{
-          localStorage.setItem(SESSION_KEY,JSON.stringify(data));
-          setSession(data);setIsAnon(false);setShowAuth(false);setShowNudge(false);
-          const u=await sb.auth.getUser(data.access_token);
-          const uid=u?.id||u?.sub||u?.user?.id;
+        if(data?.access_token) setOnboardingScreen("welcome");
+        if(data.error||!data.access_token){
+          setAuthError(data.error?.message||"Invalid email or password.");
+        } else {
+          const sessWithExpiry={...data,expires_at:Math.floor(Date.now()/1000)+(data.expires_in||3600)};
+          localStorage.setItem(SESSION_KEY,JSON.stringify(sessWithExpiry));
+          setSession(sessWithExpiry); setIsAnon(false); setShowAuth(false); setShowNudge(false);
+          const uid=data?.user?.id||data?.id;
           setUserId(uid); userIdRef.current=uid;
           await loadData(data.access_token);
         }
@@ -472,8 +532,73 @@ export default function App(){
         </div>
       )}
 
-      {/* Welcome screen */}
-      {goals.length===0?(
+      {/* Onboarding / Welcome screen — shown to unauthenticated users with no goals */}
+      {isAnon&&goals.length===0?(
+        <>
+        {onboardingScreen==="welcome"&&(
+          <div style={{display:"flex",flexDirection:"column",minHeight:"calc(100vh - 54px)",padding:"0 24px"}}>
+            <div style={{flex:1,display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center",paddingTop:40,paddingBottom:24,textAlign:"center"}}>
+              <div style={{width:72,height:72,background:acc.soft,borderRadius:24,display:"flex",alignItems:"center",justifyContent:"center",marginBottom:24}}>
+                <IponLogo size={40} color={acc.hex}/>
+              </div>
+              <div style={{fontFamily:FD,fontWeight:700,fontSize:32,letterSpacing:"-0.03em",color:T.text,marginBottom:10,lineHeight:1.1}}>Save with purpose.</div>
+              <div style={{fontSize:16,color:T.textMute,lineHeight:1.6,maxWidth:300,marginBottom:32}}>Set goals, track contributions, and know exactly how much to set aside each month.</div>
+              <div style={{fontSize:12,fontWeight:600,letterSpacing:".1em",textTransform:"uppercase",color:acc.hex,marginBottom:12,opacity:.8}}>What you get with an account</div>
+              <div style={{display:"flex",flexDirection:"column",gap:12,width:"100%",maxWidth:340,marginBottom:8}}>
+                {FEATURES.map(f=>(
+                  <div key={f.title} style={{display:"flex",alignItems:"center",gap:14,background:T.surface,border:`1px solid ${T.border}`,borderRadius:16,padding:"14px 16px",textAlign:"left"}}>
+                    <div style={{width:40,height:40,background:acc.soft,borderRadius:12,display:"flex",alignItems:"center",justifyContent:"center",fontSize:20,flexShrink:0}}>{f.emoji}</div>
+                    <div>
+                      <div style={{fontFamily:FD,fontWeight:600,fontSize:14,color:T.text,marginBottom:2}}>{f.title}</div>
+                      <div style={{fontSize:12,color:T.textMute,lineHeight:1.5}}>{f.desc}</div>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            </div>
+            <div style={{paddingBottom:48,display:"flex",flexDirection:"column",gap:10}}>
+              <button onClick={()=>setOnboardingScreen("signup")} style={{width:"100%",border:"none",borderRadius:14,padding:"16px",fontWeight:600,fontSize:16,background:acc.hex,color:"#fff",cursor:"pointer",fontFamily:FONT,letterSpacing:"-0.01em"}}>Create free account</button>
+              <button onClick={()=>setOnboardingScreen("signin")} style={{width:"100%",border:`1.5px solid ${T.border}`,borderRadius:14,padding:"15px",fontWeight:600,fontSize:16,background:T.surface,color:T.text,cursor:"pointer",fontFamily:FONT,letterSpacing:"-0.01em"}}>Sign in</button>
+              <button onClick={()=>setOnboardingScreen("guest")} style={{width:"100%",border:"none",borderRadius:14,padding:"14px",fontWeight:500,fontSize:14,background:"transparent",color:T.textMute,cursor:"pointer",fontFamily:FONT}}>Continue as guest</button>
+            </div>
+          </div>
+        )}
+        {(onboardingScreen==="signup"||onboardingScreen==="signin")&&(
+          <div style={{padding:"32px 24px 48px",display:"flex",flexDirection:"column"}}>
+            <button onClick={()=>setOnboardingScreen("welcome")} style={{background:"none",border:"none",color:T.textMute,cursor:"pointer",fontFamily:FONT,fontSize:14,textAlign:"left",padding:"0 0 24px",display:"flex",alignItems:"center",gap:6}}>← Back</button>
+            <div style={{fontFamily:FD,fontWeight:700,fontSize:26,letterSpacing:"-0.025em",color:T.text,marginBottom:4}}>{onboardingScreen==="signup"?"Create account":"Welcome back"}</div>
+            <div style={{fontSize:14,color:T.textMute,marginBottom:28}}>{onboardingScreen==="signup"?"Start saving toward what matters.":"Sign in to access your goals."}</div>
+            <div style={{marginBottom:14}}>
+              <label style={{fontSize:11,fontWeight:600,letterSpacing:".1em",textTransform:"uppercase",color:T.textMute,display:"block",marginBottom:6}}>Email</label>
+              <input type="email" placeholder="you@example.com" value={authEmail} onChange={e=>setAuthEmail(e.target.value)} style={{width:"100%",background:T.surface,border:`1px solid ${T.border}`,borderRadius:12,padding:"13px 14px",color:T.text,fontSize:15.5,fontFamily:FONT,display:"block",boxSizing:"border-box"}}/>
+            </div>
+            <div style={{marginBottom:24}}>
+              <label style={{fontSize:11,fontWeight:600,letterSpacing:".1em",textTransform:"uppercase",color:T.textMute,display:"block",marginBottom:6}}>Password</label>
+              <input type="password" placeholder={onboardingScreen==="signup"?"Min. 6 characters":"••••••••"} value={authPassword} onChange={e=>setAuthPassword(e.target.value)} onKeyDown={e=>e.key==="Enter"&&handleAuth(onboardingScreen)} style={{width:"100%",background:T.surface,border:`1px solid ${T.border}`,borderRadius:12,padding:"13px 14px",color:T.text,fontSize:15.5,fontFamily:FONT,display:"block",boxSizing:"border-box"}}/>
+            </div>
+            {authError&&<div style={{color:"#C24A3E",fontSize:13,marginBottom:12}}>{authError}</div>}
+            <button onClick={()=>handleAuth(onboardingScreen)} style={{width:"100%",border:"none",borderRadius:14,padding:"16px",fontWeight:600,fontSize:16,background:acc.hex,color:"#fff",cursor:"pointer",fontFamily:FONT}}>
+              {authLoading?"…":onboardingScreen==="signup"?"Create account":"Sign in"}
+            </button>
+            <div style={{textAlign:"center",marginTop:16,fontSize:13,color:T.textMute}}>
+              {onboardingScreen==="signup"
+                ?<>Already have an account? <button onClick={()=>setOnboardingScreen("signin")} style={{background:"none",border:"none",color:acc.hex,cursor:"pointer",fontWeight:600,fontFamily:FONT,fontSize:13}}>Sign in</button></>
+                :<>New to ipon? <button onClick={()=>setOnboardingScreen("signup")} style={{background:"none",border:"none",color:acc.hex,cursor:"pointer",fontWeight:600,fontFamily:FONT,fontSize:13}}>Create account</button></>
+              }
+            </div>
+          </div>
+        )}
+        {onboardingScreen==="guest"&&(
+          <div style={{display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center",minHeight:"calc(100vh - 54px)",padding:"0 24px",textAlign:"center"}}>
+            <div style={{fontSize:40,marginBottom:16}}>👋</div>
+            <div style={{fontFamily:FD,fontWeight:700,fontSize:22,letterSpacing:"-0.02em",color:T.text,marginBottom:8}}>You're saving as a guest</div>
+            <div style={{fontSize:14,color:T.textMute,lineHeight:1.6,maxWidth:280,marginBottom:32}}>Your goals are saved on this device only. Create an account anytime to back them up.</div>
+            <button onClick={()=>setShowAdd(true)} style={{border:"none",borderRadius:14,padding:"14px 28px",fontWeight:600,fontSize:15,background:acc.hex,color:"#fff",cursor:"pointer",fontFamily:FONT}}>Start saving</button>
+            <button onClick={()=>setOnboardingScreen("signup")} style={{marginTop:12,border:"none",background:"none",color:T.textMute,cursor:"pointer",fontFamily:FONT,fontSize:13}}>Actually, create an account</button>
+          </div>
+        )}
+        </>
+      ):(!isAnon&&goals.length===0?(
         <div style={{padding:"60px 28px 0",display:"flex",flexDirection:"column",alignItems:"center",textAlign:"center"}}>
           <div style={{width:64,height:64,background:acc.soft,borderRadius:20,display:"flex",alignItems:"center",justifyContent:"center",marginBottom:20}}>
             <IponLogo size={32} color={acc.hex}/>
@@ -515,7 +640,7 @@ export default function App(){
             </div>
           )}
         </>
-      )}
+      ))}
 
       {/* Drawer */}
       {menuOpen&&<>
@@ -591,7 +716,7 @@ export default function App(){
 
       {/* Add Goal */}
       <Sheet open={showAdd} onClose={()=>setShowAdd(false)} T={T}>
-        <GoalForm data={newG} setData={setNewG} title="New goal" sub="something worth saving for" T={T} suggestEmoji={true}/>
+        <GoalForm data={newG} setData={setNewG} title="New goal" sub="something worth saving for" T={T}/>
         <div style={{display:"flex",gap:10,marginTop:20}}>
           <Btn label="Cancel" onClick={()=>setShowAdd(false)} bg={T.surface} fg={T.text} border={`1px solid ${T.border}`}/>
           <Btn label="Create goal" onClick={handleAddGoal} bg={newG.color}/>
